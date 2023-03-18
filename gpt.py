@@ -3,16 +3,32 @@ import argparse, sys, time
 import torch
 import torch.nn as tnn
 
+# Hyperparameters Begin
+BATCH_SIZE = 64            # Number of independent sequences to process at once
+BLOCK_SIZE = 256           # Maximum context length to consider for prediction
+ITERATIONS = 5000          # Total training iterations
+ITER_EVAL  = 500           # How often to report results
+LEARNING_RATE = 3e-4       # Hyperparameter for training rate
+NUM_EMBEDDINGS = 384       # Number of embedding layers
+N_HEAD = 6                 # Number of self-attention heads
+N_LAYER = 6                # Number of layers deep in model
+DROPOUT = 0.2              # How often to dropout layers
+# Hyperparameters End
+
 VALIDATION_PERCENTAGE = 10 # Amount of data to hold back for validation
-BLOCK_SIZE = 8             # Maximum context length to consider for prediction
-BATCH_SIZE = 4             # Number of independent sequences to process at once
-LEARNING_RATE = 1e-3       # Hyperparameter for training rate
-ITERATIONS = 100000        # Total training iterations
-ITER_EVAL  = 10000         # How often to report results
-NUM_EMBEDDINGS = 32        # Number of embedding layers
 DEVICE = 'cpu'             # Which device to train with
 if torch.cuda.is_available():
     DEVICE = 'cuda'
+
+#
+# Papers
+#   Attention is all you need (Transformers)
+#        https://arxiv.org/abs/1706.03762
+#   Deep Residual Learning for Image Recognition
+#        https://arxiv.org/abs/1512.03385
+#   Dropout: A Simple Way to Prevent Neural Networks from Overfitting
+#        https://jmlr.org/papers/v15/srivastava14a.html
+#
 
 def main():
     args = parse_args()
@@ -29,7 +45,7 @@ def main():
     val_data = data[n:]
 
     # Create model
-    model = BigramLanguageModel(vocab_size)
+    model = BigramLanguageModel(vocab_size, N_LAYER, N_HEAD)
     model.to(DEVICE)
 
     # Create optimizer
@@ -110,22 +126,94 @@ def estimate_loss(model, train, val, iterations):
     model.train()
     return out
 
+class Head(tnn.Module):
+    """One head of self-attention"""
+    def __init__(self, head_size):
+        super().__init__()
+        n_embd = NUM_EMBEDDINGS
+        # Each token directly reads off the logits for the next token from a lookup table
+        self.key   = tnn.Linear(n_embd, head_size, bias=False)
+        self.query = tnn.Linear(n_embd, head_size, bias=False)
+        self.value = tnn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
+        self.dropout = tnn.Dropout(DROPOUT)
+    
+    def forward(self, x):
+        (B,T,C) = x.shape
+        k = self.key(x)                                               # (B,T,C)
+        q = self.query(x)                                             # (B,T,C)
+        # Compute attention scores, affinities between tokens
+        wei = q @ k.transpose(-2, -1) * C**-0.5                       # (B,T,C) @ (B,C,T) --> (B,T,T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B,T,T)
+        wei = tnn.functional.softmax(wei, dim=-1)                     # (B,T,T)
+        wei = self.dropout(wei)
+        # Perform weighted aggregation of the values
+        v = self.value(x)                                             # (B,T,C)
+        out = wei @ v                                                 # (B,T,T) @ (B,T,C) --> (B,T,C)
+        return out
+
+class MultiHeadAttention(tnn.Module):
+    """Multiple heads of self-attention in parallel"""
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = tnn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = tnn.Linear(NUM_EMBEDDINGS, NUM_EMBEDDINGS)
+        self.dropout = tnn.Dropout(DROPOUT)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim = -1)
+        out = self.dropout(self.proj(out))
+        return out
+
+class FeedForward(tnn.Module):
+    """A linear layer followed by non-linearity"""
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = tnn.Sequential(
+            tnn.Linear(n_embd, 4 * n_embd), 
+            tnn.ReLU(),
+            tnn.Linear(4 * n_embd, n_embd), 
+            tnn.Dropout(DROPOUT),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(tnn.Module):
+    """Transformer block: communication, followed by computation"""
+    def __init__(self, n_embd, n_head): # Embedding dimension, number of heads
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = tnn.LayerNorm(n_embd)
+        self.ln2 = tnn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
 class BigramLanguageModel(tnn.Module):
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size, n_layer, n_head):
         super().__init__()
         n_embd = NUM_EMBEDDINGS
         # Each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = tnn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = tnn.Embedding(BLOCK_SIZE, n_embd)
-        self.lm_head = tnn.Linear(n_embd, vocab_size)
+        self.blocks = tnn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_final = tnn.LayerNorm(n_embd)
+        self.lm_head  = tnn.Linear(n_embd, vocab_size)
     
     def forward(self, idx, targets=None):
         (B, T) = idx.shape
         # Index and targets are both (B,T) tensors of integers
-        tok_emb = self.token_embedding_table(idx)   # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arrange(T, device=device)) # (T,C)
-        x = tok_emb + pos_emb                       # (B,T,C)
-        logits = self.lm_head(tok_emb)              # (B,T,V_size)
+        tok_emb = self.token_embedding_table(idx)          # (B,T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=DEVICE)) # (T,C)
+        x = tok_emb + pos_emb                              # (B,T,C)
+        x = self.blocks(x)                                 # (B,T,C)
+        x = self.ln_final(x)                               # (B,T,C)
+        logits = self.lm_head(x)                           # (B,T,V_size)
 
         if targets is None:
             loss = None
@@ -141,8 +229,10 @@ class BigramLanguageModel(tnn.Module):
     def generate(self, idx, max_new_tokens):
         # Index is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
+            # Crop index to last block_size tokens
+            idx_cond = idx[:, -BLOCK_SIZE:]
             # Get predictions
-            (logits, loss) = self(idx)
+            (logits, loss) = self(idx_cond)
             # Only for the last time step, transform to (B,C)
             logits = logits[:, -1, :] 
             # Apply softmax to get probabilities
